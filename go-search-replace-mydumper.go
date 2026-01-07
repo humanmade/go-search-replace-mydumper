@@ -36,8 +36,11 @@ func main() {
 	flag.Int64Var(&maxLineSize, "max-line-size", 512*1024*1024, "Maximum allowed line size in bytes")
 
 	flag.Usage = func() {
-		fmt.Fprintf(os.Stderr, "Usage: %s [options] <input file> <output dir> <from> <to> ...\n\nOptions:\n", os.Args[0])
+		fmt.Fprintf(os.Stderr, "Usage: %s [options] <input file|-> <output dir> <from> <to> ...\n\nOptions:\n", os.Args[0])
 		flag.PrintDefaults()
+		fmt.Fprintln(os.Stderr, "\nInput:")
+		fmt.Fprintln(os.Stderr, "  <input file>  Path to mydumper backup file (.sql or .sql.gz)")
+		fmt.Fprintln(os.Stderr, "  -             Read from stdin (for mydumper --stream)")
 	}
 
 	flag.Parse()
@@ -52,38 +55,67 @@ func main() {
 	}
 
 	inputFilePath := args[0]
-
-	if _, err := os.Stat(inputFilePath); errors.Is(err, os.ErrNotExist) {
-		fmt.Fprintln(os.Stderr, fmt.Sprintf("File %s does not exist", inputFilePath))
-		os.Exit(1)
-		return
-	}
-
-	inputFile, err := os.Open(inputFilePath)
-	if err != nil {
-		panic(err)
-	}
-	defer inputFile.Close()
-
-	// Create a reader based on file extension
 	var reader io.Reader
-	if filepath.Ext(inputFilePath) == ".gz" {
-		gzr, err := pgzip.NewReader(inputFile)
+	var gzr *pgzip.Reader
+	var err error
+	isStdinMode := inputFilePath == "-"
+
+	if isStdinMode {
+		// Stdin mode: detect compression from content
+		inputFilePath = "stdin" // For display purposes
+
+		bufferedReader := bufio.NewReader(os.Stdin)
+		var magicBytes []byte
+		magicBytes, err = bufferedReader.Peek(2)
+		if err != nil && err != io.EOF {
+			panic(err)
+		}
+
+		// Check for gzip magic bytes (0x1f 0x8b)
+		if len(magicBytes) >= 2 && magicBytes[0] == 0x1f && magicBytes[1] == 0x8b {
+			gzr, err = pgzip.NewReader(bufferedReader)
+			if err != nil {
+				fmt.Fprintf(os.Stderr, "Error reading compressed stdin: %v\n", err)
+				panic(err)
+			}
+			defer gzr.Close()
+			reader = gzr
+		} else {
+			reader = bufferedReader
+		}
+	} else {
+		// File mode: existing behavior unchanged
+		if _, err = os.Stat(inputFilePath); errors.Is(err, os.ErrNotExist) {
+			fmt.Fprintln(os.Stderr, fmt.Sprintf("File %s does not exist", inputFilePath))
+			os.Exit(1)
+			return
+		}
+
+		var inputFile *os.File
+		inputFile, err = os.Open(inputFilePath)
 		if err != nil {
 			panic(err)
 		}
-		defer gzr.Close()
-		reader = gzr
-	} else {
-		reader = inputFile
+		defer inputFile.Close()
+
+		if filepath.Ext(inputFilePath) == ".gz" {
+			gzr, err = pgzip.NewReader(inputFile)
+			if err != nil {
+				panic(err)
+			}
+			defer gzr.Close()
+			reader = gzr
+		} else {
+			reader = inputFile
+		}
 	}
 
 	dataFileRegex := regexp.MustCompile(`\d+.sql$`)
 
 	outputDir := args[1]
 
-	if _, err := os.Stat(outputDir); os.IsNotExist(err) {
-		if err := os.MkdirAll(outputDir, 0755); err != nil {
+	if _, err = os.Stat(outputDir); os.IsNotExist(err) {
+		if err = os.MkdirAll(outputDir, 0755); err != nil {
 			fmt.Fprintln(os.Stderr, fmt.Sprintf("Error creating output directory: %v", err))
 			os.Exit(1)
 			return
@@ -101,7 +133,11 @@ func main() {
 		return
 	}
 
-	fmt.Println("go-search-replace-mydumper: Processing file:", inputFilePath)
+	if isStdinMode {
+		fmt.Println("go-search-replace-mydumper: Processing from stdin")
+	} else {
+		fmt.Println("go-search-replace-mydumper: Processing file:", inputFilePath)
+	}
 	fmt.Println("go-search-replace-mydumper: Output directory:", outputDir)
 	fmt.Println("go-search-replace-mydumper: Replacements:", rawReplacements)
 
