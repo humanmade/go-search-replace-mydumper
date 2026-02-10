@@ -28,15 +28,21 @@ var (
 	bad         = regexp.MustCompile(badInputRe)
 	bufferSize  int
 	maxLineSize int64
+	streamMode  string
+	forward     bool
 )
 
 func main() {
-	// Define flags first
 	flag.IntVar(&bufferSize, "buffer-size", 2*1024*1024, "Size of read buffer in bytes")
 	flag.Int64Var(&maxLineSize, "max-line-size", 512*1024*1024, "Maximum allowed line size in bytes")
+	flag.StringVar(&streamMode, "stream", "", "Stream mode: NO_STREAM or NO_STREAM_AND_NO_DELETE (read mydumper markers from stdin, process files in-place)")
+	flag.BoolVar(&forward, "forward", false, "Forward stdin lines to stdout (for piping to myloader, requires --stream)")
 
 	flag.Usage = func() {
-		fmt.Fprintf(os.Stderr, "Usage: %s [options] <input file> <output dir> <from> <to> ...\n\nOptions:\n", os.Args[0])
+		fmt.Fprintf(os.Stderr, "Usage:\n")
+		fmt.Fprintf(os.Stderr, "  Split mode:  %s [options] <input file> <output dir> <from> <to> ...\n", os.Args[0])
+		fmt.Fprintf(os.Stderr, "  Stream mode: %s --stream=NO_STREAM_AND_NO_DELETE [--forward] [options] <datadir> <from> <to> ...\n\n", os.Args[0])
+		fmt.Fprintf(os.Stderr, "Options:\n")
 		flag.PrintDefaults()
 	}
 
@@ -44,17 +50,39 @@ func main() {
 
 	args := flag.Args()
 
-	if len(args) < 2 {
-		flag.Usage()
-
-		os.Exit(1)
-		return
+	if streamMode != "" {
+		if streamMode != "NO_STREAM" && streamMode != "NO_STREAM_AND_NO_DELETE" {
+			fmt.Fprintf(os.Stderr, "Invalid --stream value %q: must be NO_STREAM or NO_STREAM_AND_NO_DELETE\n", streamMode)
+			os.Exit(1)
+			return
+		}
+		if len(args) < 1 {
+			flag.Usage()
+			os.Exit(1)
+			return
+		}
+		dataDir := args[0]
+		if info, err := os.Stat(dataDir); err != nil || !info.IsDir() {
+			fmt.Fprintf(os.Stderr, "Data directory %s does not exist or is not a directory\n", dataDir)
+			os.Exit(1)
+			return
+		}
+		runStreamMode(dataDir, args[1:])
+	} else {
+		if len(args) < 2 {
+			flag.Usage()
+			os.Exit(1)
+			return
+		}
+		runSplitMode(args)
 	}
+}
 
+func runSplitMode(args []string) {
 	inputFilePath := args[0]
 
 	if _, err := os.Stat(inputFilePath); errors.Is(err, os.ErrNotExist) {
-		fmt.Fprintln(os.Stderr, fmt.Sprintf("File %s does not exist", inputFilePath))
+		fmt.Fprintf(os.Stderr, "File %s does not exist\n", inputFilePath)
 		os.Exit(1)
 		return
 	}
@@ -233,6 +261,153 @@ func main() {
 	}
 
 	fmt.Printf("go-search-replace-mydumper: Finished successfully. took %v\n", time.Since(start))
+}
+
+func runStreamMode(dataDir string, rawReplacements []string) {
+	if len(rawReplacements)%2 > 0 {
+		fmt.Fprintln(os.Stderr, "All replacements must have a <from> and <to> value")
+		os.Exit(1)
+		return
+	}
+
+	var replacements []*searchreplace.Replacement
+	for i := 0; i < len(rawReplacements)/2; i++ {
+		from := rawReplacements[i*2]
+		if !validInput(from, minInLength) {
+			fmt.Fprintln(os.Stderr, "Invalid <from> URL, minimum length is 4")
+			os.Exit(2)
+			return
+		}
+		to := rawReplacements[(i*2)+1]
+		if !validInput(to, minOutLength) {
+			fmt.Fprintln(os.Stderr, "Invalid <to>, minimum length is 2")
+			os.Exit(3)
+			return
+		}
+		replacements = append(replacements, &searchreplace.Replacement{
+			From: []byte(from),
+			To:   []byte(to),
+		})
+	}
+
+	hasReplacements := len(replacements) > 0
+	var containsRegex *regexp.Regexp
+	if hasReplacements {
+		containsRegex = fromEntriesContainsRegex(replacements)
+	}
+
+	dataFileRegex := regexp.MustCompile(`\d+\.sql$`)
+	markerRegex := regexp.MustCompile(`^--\s+([\S]+)\s+\d+`)
+
+	fmt.Fprintln(os.Stderr, "go-search-replace-mydumper: Stream mode, datadir:", dataDir)
+	fmt.Fprintln(os.Stderr, "go-search-replace-mydumper: Replacements:", rawReplacements)
+
+	start := time.Now()
+	filesProcessed := 0
+
+	stdout := bufio.NewWriter(os.Stdout)
+	defer stdout.Flush()
+
+	scanner := bufio.NewScanner(os.Stdin)
+	scanner.Buffer(make([]byte, 0, bufferSize), bufferSize)
+
+	for scanner.Scan() {
+		line := scanner.Text()
+
+		if matches := markerRegex.FindStringSubmatch(line); matches != nil {
+			filename := matches[1]
+
+			if hasReplacements && dataFileRegex.MatchString(filename) {
+				filePath := filepath.Join(dataDir, filename)
+				if err := processFileInPlace(filePath, replacements, containsRegex); err != nil {
+					fmt.Fprintf(os.Stderr, "go-search-replace-mydumper: Error processing %s: %v\n", filename, err)
+					os.Exit(1)
+					return
+				}
+				filesProcessed++
+			}
+		}
+
+		if forward {
+			fmt.Fprintln(stdout, line)
+			stdout.Flush()
+		}
+	}
+
+	if err := scanner.Err(); err != nil {
+		fmt.Fprintf(os.Stderr, "go-search-replace-mydumper: Error reading stdin: %v\n", err)
+		os.Exit(1)
+		return
+	}
+
+	fmt.Fprintf(os.Stderr, "go-search-replace-mydumper: Stream finished. Processed %d data files in %v\n", filesProcessed, time.Since(start))
+}
+
+func processFileInPlace(filePath string, replacements []*searchreplace.Replacement, containsRegex *regexp.Regexp) error {
+	src, err := os.Open(filePath)
+	if err != nil {
+		return fmt.Errorf("open source: %w", err)
+	}
+	defer src.Close()
+
+	tmpPath := filePath + ".tmp"
+	dst, err := os.OpenFile(tmpPath, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0644)
+	if err != nil {
+		return fmt.Errorf("create temp file: %w", err)
+	}
+
+	writer := bufio.NewWriterSize(dst, bufferSize)
+	r := bufio.NewReaderSize(src, bufferSize)
+
+	for {
+		line, err := readFullLine(r)
+		if err != nil {
+			if err == io.EOF {
+				if len(line) == 0 {
+					break
+				}
+			} else {
+				dst.Close()
+				os.Remove(tmpPath)
+				return fmt.Errorf("read line: %w", err)
+			}
+		}
+
+		if containsRegex.Match(line) {
+			replaced := searchreplace.FixLine(&line, replacements)
+			if _, werr := writer.Write(*replaced); werr != nil {
+				dst.Close()
+				os.Remove(tmpPath)
+				return fmt.Errorf("write: %w", werr)
+			}
+		} else {
+			if _, werr := writer.Write(line); werr != nil {
+				dst.Close()
+				os.Remove(tmpPath)
+				return fmt.Errorf("write: %w", werr)
+			}
+		}
+	}
+
+	if err := writer.Flush(); err != nil {
+		dst.Close()
+		os.Remove(tmpPath)
+		return fmt.Errorf("flush: %w", err)
+	}
+
+	if err := dst.Close(); err != nil {
+		os.Remove(tmpPath)
+		return fmt.Errorf("close temp: %w", err)
+	}
+
+	src.Close()
+
+	if err := os.Rename(tmpPath, filePath); err != nil {
+		os.Remove(tmpPath)
+		return fmt.Errorf("rename: %w", err)
+	}
+
+	return nil
 }
 
 // readFullLine reads a complete line from the reader, handling lines larger than the buffer size
