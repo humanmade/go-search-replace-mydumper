@@ -111,7 +111,7 @@ func runSplitMode(args []string) {
 		reader = inputFile
 	}
 
-	dataFileRegex := regexp.MustCompile(`\d+.sql$`)
+	dataFileRegex := regexp.MustCompile(`\d+\.(sql|dat)$`)
 
 	outputDir := args[1]
 
@@ -295,7 +295,7 @@ func runStreamMode(dataDir string, rawReplacements []string, stdinReader io.Read
 
 	hasReplacements := len(replacements) > 0
 
-	dataFileRegex := regexp.MustCompile(`\d+\.sql$`)
+	dataFileRegex := regexp.MustCompile(`\d+\.(sql|dat)$`)
 	markerRegex := regexp.MustCompile(`^--\s+([\S]+)\s+\d+`)
 
 	numWorkers := workers
