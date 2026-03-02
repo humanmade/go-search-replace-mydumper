@@ -67,7 +67,7 @@ func main() {
 			os.Exit(1)
 			return
 		}
-		runStreamMode(dataDir, args[1:])
+		runStreamMode(dataDir, args[1:], os.Stdin)
 	} else {
 		if len(args) < 2 {
 			flag.Usage()
@@ -159,8 +159,6 @@ func runSplitMode(args []string) {
 
 	hasReplacements := len(replacements) > 0
 
-	fromEntriesContainsRegex := fromEntriesContainsRegex(replacements)
-
 	pattern := `^--\s+([\S]+)\s+\d+`
 	filenameRegex := regexp.MustCompile(pattern)
 
@@ -223,7 +221,7 @@ func runSplitMode(args []string) {
 		} else {
 			if keep && writer != nil {
 				if isDataFile {
-					if hasReplacements && fromEntriesContainsRegex.Match(line) {
+					if hasReplacements && lineContainsAny(line, replacements) {
 						replaced := searchreplace.FixLine(&line, replacements)
 						_, err = writer.Write(*replaced)
 					} else {
@@ -263,7 +261,7 @@ func runSplitMode(args []string) {
 	fmt.Printf("go-search-replace-mydumper: Finished successfully. took %v\n", time.Since(start))
 }
 
-func runStreamMode(dataDir string, rawReplacements []string) {
+func runStreamMode(dataDir string, rawReplacements []string, stdinReader io.Reader) {
 	if len(rawReplacements)%2 > 0 {
 		fmt.Fprintln(os.Stderr, "All replacements must have a <from> and <to> value")
 		os.Exit(1)
@@ -291,10 +289,6 @@ func runStreamMode(dataDir string, rawReplacements []string) {
 	}
 
 	hasReplacements := len(replacements) > 0
-	var containsRegex *regexp.Regexp
-	if hasReplacements {
-		containsRegex = fromEntriesContainsRegex(replacements)
-	}
 
 	dataFileRegex := regexp.MustCompile(`\d+\.sql$`)
 	markerRegex := regexp.MustCompile(`^--\s+([\S]+)\s+\d+`)
@@ -308,7 +302,7 @@ func runStreamMode(dataDir string, rawReplacements []string) {
 	stdout := bufio.NewWriter(os.Stdout)
 	defer stdout.Flush()
 
-	scanner := bufio.NewScanner(os.Stdin)
+	scanner := bufio.NewScanner(stdinReader)
 	scanner.Buffer(make([]byte, 0, bufferSize), bufferSize)
 
 	for scanner.Scan() {
@@ -319,7 +313,7 @@ func runStreamMode(dataDir string, rawReplacements []string) {
 
 			if hasReplacements && dataFileRegex.MatchString(filename) {
 				filePath := filepath.Join(dataDir, filename)
-				if err := processFileInPlace(filePath, replacements, containsRegex); err != nil {
+				if err := processFileInPlace(filePath, replacements); err != nil {
 					fmt.Fprintf(os.Stderr, "go-search-replace-mydumper: Error processing %s: %v\n", filename, err)
 					os.Exit(1)
 					return
@@ -343,7 +337,7 @@ func runStreamMode(dataDir string, rawReplacements []string) {
 	fmt.Fprintf(os.Stderr, "go-search-replace-mydumper: Stream finished. Processed %d data files in %v\n", filesProcessed, time.Since(start))
 }
 
-func processFileInPlace(filePath string, replacements []*searchreplace.Replacement, containsRegex *regexp.Regexp) error {
+func processFileInPlace(filePath string, replacements []*searchreplace.Replacement) error {
 	src, err := os.Open(filePath)
 	if err != nil {
 		return fmt.Errorf("open source: %w", err)
@@ -373,7 +367,7 @@ func processFileInPlace(filePath string, replacements []*searchreplace.Replaceme
 			}
 		}
 
-		if containsRegex.Match(line) {
+		if lineContainsAny(line, replacements) {
 			replaced := searchreplace.FixLine(&line, replacements)
 			if _, werr := writer.Write(*replaced); werr != nil {
 				dst.Close()
@@ -408,6 +402,16 @@ func processFileInPlace(filePath string, replacements []*searchreplace.Replaceme
 	}
 
 	return nil
+}
+
+// lineContainsAny checks if line contains any of the replacement "from" byte sequences.
+func lineContainsAny(line []byte, replacements []*searchreplace.Replacement) bool {
+	for _, r := range replacements {
+		if bytes.Contains(line, r.From) {
+			return true
+		}
+	}
+	return false
 }
 
 // readFullLine reads a complete line from the reader, handling lines larger than the buffer size
