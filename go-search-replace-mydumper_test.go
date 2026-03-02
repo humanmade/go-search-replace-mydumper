@@ -8,6 +8,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
 
@@ -199,6 +200,8 @@ var (
 func TestMain(m *testing.M) {
 	bufferSize = 2 * 1024 * 1024
 	maxLineSize = 512 * 1024 * 1024
+	workers = runtime.NumCPU()
+
 	testConcatFile, testDataDir, testMarkers = ensureDataset(multiNumFiles, multiLinesPerFile)
 	testLargeFile = ensureSingleFile(singleLargeLines)
 

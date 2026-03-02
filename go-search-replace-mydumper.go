@@ -10,6 +10,9 @@ import (
 	"os"
 	"path/filepath"
 	"regexp"
+	"runtime"
+	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/Automattic/go-search-replace/searchreplace"
@@ -30,6 +33,7 @@ var (
 	maxLineSize int64
 	streamMode  string
 	forward     bool
+	workers     int
 )
 
 func main() {
@@ -37,6 +41,7 @@ func main() {
 	flag.Int64Var(&maxLineSize, "max-line-size", 512*1024*1024, "Maximum allowed line size in bytes")
 	flag.StringVar(&streamMode, "stream", "", "Stream mode: NO_STREAM or NO_STREAM_AND_NO_DELETE (read mydumper markers from stdin, process files in-place)")
 	flag.BoolVar(&forward, "forward", false, "Forward stdin lines to stdout (for piping to myloader, requires --stream)")
+	flag.IntVar(&workers, "workers", runtime.NumCPU(), "Number of parallel workers for stream mode file processing")
 
 	flag.Usage = func() {
 		fmt.Fprintf(os.Stderr, "Usage:\n")
@@ -293,14 +298,39 @@ func runStreamMode(dataDir string, rawReplacements []string, stdinReader io.Read
 	dataFileRegex := regexp.MustCompile(`\d+\.sql$`)
 	markerRegex := regexp.MustCompile(`^--\s+([\S]+)\s+\d+`)
 
+	numWorkers := workers
+	if numWorkers < 1 {
+		numWorkers = 1
+	}
+
 	fmt.Fprintln(os.Stderr, "go-search-replace-mydumper: Stream mode, datadir:", dataDir)
 	fmt.Fprintln(os.Stderr, "go-search-replace-mydumper: Replacements:", rawReplacements)
+	fmt.Fprintf(os.Stderr, "go-search-replace-mydumper: Workers: %d\n", numWorkers)
 
 	start := time.Now()
-	filesProcessed := 0
+	var filesProcessed atomic.Int64
 
 	stdout := bufio.NewWriter(os.Stdout)
 	defer stdout.Flush()
+
+	// Worker pool.
+	fileCh := make(chan string, numWorkers*2)
+	var wg sync.WaitGroup
+	var workerErr atomic.Value // stores first error
+
+	for w := 0; w < numWorkers; w++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for filePath := range fileCh {
+				if err := processFileInPlace(filePath, replacements); err != nil {
+					workerErr.CompareAndSwap(nil, err)
+					return
+				}
+				filesProcessed.Add(1)
+			}
+		}()
+	}
 
 	scanner := bufio.NewScanner(stdinReader)
 	scanner.Buffer(make([]byte, 0, bufferSize), bufferSize)
@@ -312,13 +342,11 @@ func runStreamMode(dataDir string, rawReplacements []string, stdinReader io.Read
 			filename := matches[1]
 
 			if hasReplacements && dataFileRegex.MatchString(filename) {
-				filePath := filepath.Join(dataDir, filename)
-				if err := processFileInPlace(filePath, replacements); err != nil {
-					fmt.Fprintf(os.Stderr, "go-search-replace-mydumper: Error processing %s: %v\n", filename, err)
-					os.Exit(1)
-					return
+				// Stop sending work if a worker hit an error.
+				if v := workerErr.Load(); v != nil {
+					break
 				}
-				filesProcessed++
+				fileCh <- filepath.Join(dataDir, filename)
 			}
 		}
 
@@ -328,13 +356,22 @@ func runStreamMode(dataDir string, rawReplacements []string, stdinReader io.Read
 		}
 	}
 
+	close(fileCh)
+	wg.Wait()
+
+	if v := workerErr.Load(); v != nil {
+		fmt.Fprintf(os.Stderr, "go-search-replace-mydumper: Error processing file: %v\n", v)
+		os.Exit(1)
+		return
+	}
+
 	if err := scanner.Err(); err != nil {
 		fmt.Fprintf(os.Stderr, "go-search-replace-mydumper: Error reading stdin: %v\n", err)
 		os.Exit(1)
 		return
 	}
 
-	fmt.Fprintf(os.Stderr, "go-search-replace-mydumper: Stream finished. Processed %d data files in %v\n", filesProcessed, time.Since(start))
+	fmt.Fprintf(os.Stderr, "go-search-replace-mydumper: Stream finished. Processed %d data files in %v\n", filesProcessed.Load(), time.Since(start))
 }
 
 func processFileInPlace(filePath string, replacements []*searchreplace.Replacement) error {
