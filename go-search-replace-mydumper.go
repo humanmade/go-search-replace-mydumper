@@ -310,11 +310,14 @@ func runStreamMode(dataDir string, rawReplacements []string, stdinReader io.Read
 	start := time.Now()
 	var filesProcessed atomic.Int64
 
-	stdout := bufio.NewWriter(os.Stdout)
-	defer stdout.Flush()
+	// Worker pool: workers process files and send completed markers to forwardCh.
+	type workItem struct {
+		filePath string
+		marker   string // original stdin line to forward after completion
+	}
 
-	// Worker pool.
-	fileCh := make(chan string, numWorkers*2)
+	fileCh := make(chan workItem, numWorkers*2)
+	forwardCh := make(chan string, numWorkers*2)
 	var wg sync.WaitGroup
 	var workerErr atomic.Value // stores first error
 
@@ -322,12 +325,30 @@ func runStreamMode(dataDir string, rawReplacements []string, stdinReader io.Read
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			for filePath := range fileCh {
-				if err := processFileInPlace(filePath, replacements); err != nil {
+			for item := range fileCh {
+				if err := processFileInPlace(item.filePath, replacements); err != nil {
 					workerErr.CompareAndSwap(nil, err)
 					return
 				}
 				filesProcessed.Add(1)
+				if forward && item.marker != "" {
+					forwardCh <- item.marker
+				}
+			}
+		}()
+	}
+
+	// Forwarding goroutine: writes completed markers to stdout.
+	var forwardWg sync.WaitGroup
+	if forward {
+		forwardWg.Add(1)
+		go func() {
+			defer forwardWg.Done()
+			stdout := bufio.NewWriter(os.Stdout)
+			defer stdout.Flush()
+			for line := range forwardCh {
+				fmt.Fprintln(stdout, line)
+				stdout.Flush()
 			}
 		}()
 	}
@@ -346,18 +367,24 @@ func runStreamMode(dataDir string, rawReplacements []string, stdinReader io.Read
 				if v := workerErr.Load(); v != nil {
 					break
 				}
-				fileCh <- filepath.Join(dataDir, filename)
+				fileCh <- workItem{
+					filePath: filepath.Join(dataDir, filename),
+					marker:   line,
+				}
+			} else if forward {
+				// Non-data files: forward immediately (no processing needed).
+				forwardCh <- line
 			}
-		}
-
-		if forward {
-			fmt.Fprintln(stdout, line)
-			stdout.Flush()
+		} else if forward {
+			// Non-marker lines: forward immediately.
+			forwardCh <- line
 		}
 	}
 
 	close(fileCh)
 	wg.Wait()
+	close(forwardCh)
+	forwardWg.Wait()
 
 	if v := workerErr.Load(); v != nil {
 		fmt.Fprintf(os.Stderr, "go-search-replace-mydumper: Error processing file: %v\n", v)
