@@ -310,14 +310,21 @@ func runStreamMode(dataDir string, rawReplacements []string, stdinReader io.Read
 	start := time.Now()
 	var filesProcessed atomic.Int64
 
-	// Worker pool: workers process files and send completed markers to forwardCh.
+	// Each stdin line becomes a forwardItem. Data files get processed by workers
+	// who close the done channel on completion. Non-data lines have done pre-closed
+	// so the forwarder can emit them immediately while preserving stdin order.
+	type forwardItem struct {
+		line string
+		done chan struct{}
+	}
+
 	type workItem struct {
 		filePath string
-		marker   string // original stdin line to forward after completion
+		done     chan struct{}
 	}
 
 	fileCh := make(chan workItem, numWorkers*2)
-	forwardCh := make(chan string, numWorkers*2)
+	orderCh := make(chan forwardItem, numWorkers*4)
 	var wg sync.WaitGroup
 	var workerErr atomic.Value // stores first error
 
@@ -328,17 +335,17 @@ func runStreamMode(dataDir string, rawReplacements []string, stdinReader io.Read
 			for item := range fileCh {
 				if err := processFileInPlace(item.filePath, replacements); err != nil {
 					workerErr.CompareAndSwap(nil, err)
+					close(item.done)
 					return
 				}
 				filesProcessed.Add(1)
-				if forward && item.marker != "" {
-					forwardCh <- item.marker
-				}
+				close(item.done)
 			}
 		}()
 	}
 
-	// Forwarding goroutine: writes completed markers to stdout.
+	// Forwarding goroutine: emits lines to stdout in stdin order.
+	// Waits on each item's done channel before writing.
 	var forwardWg sync.WaitGroup
 	if forward {
 		forwardWg.Add(1)
@@ -346,8 +353,13 @@ func runStreamMode(dataDir string, rawReplacements []string, stdinReader io.Read
 			defer forwardWg.Done()
 			stdout := bufio.NewWriter(os.Stdout)
 			defer stdout.Flush()
-			for line := range forwardCh {
-				fmt.Fprintln(stdout, line)
+			for item := range orderCh {
+				<-item.done
+				// Stop forwarding if a worker errored.
+				if v := workerErr.Load(); v != nil {
+					return
+				}
+				fmt.Fprintln(stdout, item.line)
 				stdout.Flush()
 			}
 		}()
@@ -356,6 +368,9 @@ func runStreamMode(dataDir string, rawReplacements []string, stdinReader io.Read
 	scanner := bufio.NewScanner(stdinReader)
 	scanner.Buffer(make([]byte, 0, bufferSize), bufferSize)
 
+	closedCh := make(chan struct{})
+	close(closedCh)
+
 	for scanner.Scan() {
 		line := scanner.Text()
 
@@ -363,27 +378,28 @@ func runStreamMode(dataDir string, rawReplacements []string, stdinReader io.Read
 			filename := matches[1]
 
 			if hasReplacements && dataFileRegex.MatchString(filename) {
-				// Stop sending work if a worker hit an error.
 				if v := workerErr.Load(); v != nil {
 					break
 				}
+				done := make(chan struct{})
 				fileCh <- workItem{
 					filePath: filepath.Join(dataDir, filename),
-					marker:   line,
+					done:     done,
+				}
+				if forward {
+					orderCh <- forwardItem{line: line, done: done}
 				}
 			} else if forward {
-				// Non-data files: forward immediately (no processing needed).
-				forwardCh <- line
+				orderCh <- forwardItem{line: line, done: closedCh}
 			}
 		} else if forward {
-			// Non-marker lines: forward immediately.
-			forwardCh <- line
+			orderCh <- forwardItem{line: line, done: closedCh}
 		}
 	}
 
 	close(fileCh)
 	wg.Wait()
-	close(forwardCh)
+	close(orderCh)
 	forwardWg.Wait()
 
 	if v := workerErr.Load(); v != nil {
